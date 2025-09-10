@@ -59,7 +59,7 @@ jobs:
   build-and-scan:
     name: Build and analyze
     runs-on: ubuntu-24.04            # Explicit runner version for reproducibility
-    timeout-minutes: 15              # Cap wall‑clock time for the job
+    timeout-minutes: 30              # Cap wall‑clock time for the job
     permissions:
       contents: read                 # Read‑only; no secret write scopes here
     env:
@@ -232,7 +232,7 @@ jobs:
               json.dump(sarif, f, ensure_ascii=False)
           print(f"Wrote {len(issues)} issues to reports/sonarcloud.sarif")
           PY
-        timeout-minutes: 3
+        timeout-minutes: 15
 
       # Keep an auditable copy of the SARIF. Do not upload secrets.
       - name: Upload SARIF as artifact
@@ -248,7 +248,7 @@ jobs:
     name: Publish SARIF to Code Scanning
     needs: build-and-scan               # Run only after SARIF is produced
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
     permissions:
       contents: read
       security-events: write            # Narrow write scope to this tiny, isolated job
