@@ -75,7 +75,7 @@ jobs:
   build-and-scan:
     name: Build and analyze
     runs-on: ubuntu-24.04            # Explicit runner version for reproducibility
-    timeout-minutes: 30              # Cap wall-clock time for the job
+    timeout-minutes: 45              # Bump a bit to avoid SIGTERM on slow builds
     permissions:
       contents: read                 # Read-only; no secret write scopes here
     env:
@@ -126,7 +126,7 @@ jobs:
 
           # Flags to enrich static analysis signals and harden builds.
           BASE_CFLAGS="-O2 -g -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fPIE"
-          # Wrapped build warnings (lenient): intentionally **exclude** -Wnull-dereference here
+          # Wrapped build warnings (lenient): exclude -Wnull-dereference; keep build reliable
           HARDEN_WARNINGS_WRAP="-Wall -Wextra -Wformat=2 -Wformat-security -Wconversion -Wshadow -Wduplicated-cond -Wlogical-op -fno-common"
           LDFLAGS="-Wl,-z,relro,-z,now -pie"
 
@@ -134,6 +134,7 @@ jobs:
           RELAXED_FLAGS="-Wno-error"
 
           # Wrap both configure (so generator records our flags) and build (actual compilation).
+          # Also: build ONLY the main targets to avoid compiling heavy test targets.
           build-wrapper-linux-x86-64 --out-dir "${BW_OUT}" bash -lc "
             cmake -S . -B build -G Ninja \
               -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -142,28 +143,32 @@ jobs:
               -DCMAKE_C_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS}' \
               -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS}' \
               -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO='${LDFLAGS}';
-            cmake --build build -j\$(nproc)
+            cmake --build build --target synopsis synopsis_cli -j\$(nproc)
           "
-        timeout-minutes: 120
+        timeout-minutes: 25
 
       # Optional secondary builds to enrich static analysis signals (do not gate CI)
       - name: Secondary analysis-only CMake builds (fanalyzer, ASan/UBSan)
         run: |
           set -euxo pipefail
-          # GCC/Clang static analyzer pass (C and C++)
+
+          # 1) GCC/Clang static analyzer pass
+          #    - Apply -fanalyzer ONLY to C, not to C++ (saves lots of RAM/CPU)
           cmake -S . -B build-fan -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_C_FLAGS_RELWITHDEBINFO='-O1 -g -fanalyzer -Wnull-dereference' \
-            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O1 -g -fanalyzer -Wnull-dereference' || true
-          cmake --build build-fan -j"$(nproc)" || true
+            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O1 -g' || true
+          # Limit parallelism to reduce peak memory (avoid SIGTERM/OOM)
+          cmake --build build-fan --target synopsis synopsis_cli -j1 || true
 
-          # ASan/UBSan build (linker needs the sanitizer runtime too)
+          # 2) ASan/UBSan build (non-gating)
           cmake -S . -B build-sanitizers -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_C_FLAGS_RELWITHDEBINFO='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -Wnull-dereference' \
-            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -Wnull-dereference' \
+            -DCMAKE_C_FLAGS_RELWITHDEBINFO='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' \
+            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' \
             -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO='-fsanitize=address,undefined' || true
-          cmake --build build-sanitizers -j"$(nproc)" || true
+          cmake --build build-sanitizers --target synopsis synopsis_cli -j2 || true
+        timeout-minutes: 15
 
       # Fail fast if the wrapper didn't produce the expected file
       - name: Verify compile_commands.json exists
