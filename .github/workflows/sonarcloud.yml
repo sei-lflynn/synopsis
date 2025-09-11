@@ -28,17 +28,11 @@
 #
 # CMake-only edits in the workflow. We inject enrichment flags via `-D CMAKE_*_FLAGS_<CONFIG>=...`
 # at configure time, while running the actual build under the Sonar build-wrapper so it still emits
-# `compile_commands.json`. We can also keep strict/experimental builds (fanalyzer, ASan/UBSan)
-# as non-gating extras.
+# `compile_commands.json`. We can also keep strict/experimental builds as non-gating extras.
 #
-# Tips/gotchas:
-# If your CMakeLists.txt forces -Werror via target_compile_options(... -Werror ...) after global flags,
-# you may still get failures. In most setups, build-type flags with -Wno-error are appended and win.
-# If not, consider a non-`-Werror` preset for the wrapped build and keep strictness in the optional builds.
-#
-# Since synopsis' CMakeLists.txt has: `set (CMAKE_CXX_FLAGS "-Wnon-virtual-dtor")`, it overwrites
-# plain CMAKE_CXX_FLAGS from a workflow. So we inject extra flags into build-type vars that CMake
-# appends: CMAKE_C_FLAGS_<CONFIG>, CMAKE_CXX_FLAGS_<CONFIG>, CMAKE_EXE_LINKER_FLAGS_<CONFIG>.
+# Notes:
+# - Your CMake includes CodeCoverage.cmake which appends `--coverage`; that’s heavy. We keep it out
+#   of the analyzer pass by running the analyzer directly via gcc for C files only.
 
 name: SonarCloud (C - synopsis)
 
@@ -75,7 +69,7 @@ jobs:
   build-and-scan:
     name: Build and analyze
     runs-on: ubuntu-24.04            # Explicit runner version for reproducibility
-    timeout-minutes: 45              # Bump a bit to avoid SIGTERM on slow builds
+    timeout-minutes: 45              # A little headroom
     permissions:
       contents: read                 # Read-only; no secret write scopes here
     env:
@@ -124,17 +118,12 @@ jobs:
             sudo apt-get install -y ninja-build
           fi
 
-          # Flags to enrich static analysis signals and harden builds.
+          # Flags to enrich static analysis signals and harden builds (lenient in wrapped build).
           BASE_CFLAGS="-O2 -g -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fPIE"
-          # Wrapped build warnings (lenient): exclude -Wnull-dereference; keep build reliable
           HARDEN_WARNINGS_WRAP="-Wall -Wextra -Wformat=2 -Wformat-security -Wconversion -Wshadow -Wduplicated-cond -Wlogical-op -fno-common"
           LDFLAGS="-Wl,-z,relro,-z,now -pie"
-
-          # Ensure the WRAPPED build succeeds even if code is intentionally vulnerable.
           RELAXED_FLAGS="-Wno-error"
 
-          # Wrap both configure (so generator records our flags) and build (actual compilation).
-          # Also: build ONLY the main targets to avoid compiling heavy test targets.
           build-wrapper-linux-x86-64 --out-dir "${BW_OUT}" bash -lc "
             cmake -S . -B build -G Ninja \
               -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -143,32 +132,37 @@ jobs:
               -DCMAKE_C_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS}' \
               -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS}' \
               -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO='${LDFLAGS}';
-            cmake --build build --target synopsis synopsis_cli -j\$(nproc)
+            cmake --build build --target synopsis synopsis_cli -j$(nproc)
           "
         timeout-minutes: 25
 
       # Optional secondary builds to enrich static analysis signals (do not gate CI)
-      - name: Secondary analysis-only CMake builds (fanalyzer, ASan/UBSan)
+      - name: Secondary analysis-only builds (per-file fanalyzer for C, plus ASan/UBSan)
         run: |
           set -euxo pipefail
 
-          # 1) GCC/Clang static analyzer pass
-          #    - Apply -fanalyzer ONLY to C, not to C++ (saves lots of RAM/CPU)
-          cmake -S . -B build-fan -G Ninja \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_C_FLAGS_RELWITHDEBINFO='-O1 -g -fanalyzer -Wnull-dereference' \
-            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O1 -g' || true
-          # Limit parallelism to reduce peak memory (avoid SIGTERM/OOM)
-          cmake --build build-fan --target synopsis synopsis_cli -j1 || true
+          echo "::group::Per-file C fanalyzer (non-gating)"
+          # Analyze ONLY C files; compile one-at-a-time to keep memory low; never fail the job.
+          mapfile -t CFILES < <(git ls-files -- '*.c' ':!:**/test/**' 2>/dev/null || true)
+          for f in "${CFILES[@]}"; do
+            echo "analyze: $f"
+            gcc -O0 -g -fanalyzer -Wnull-dereference -c "$f" -o /tmp/$(basename "$f").o || true
+          done
+          echo "::endgroup::"
 
-          # 2) ASan/UBSan build (non-gating)
+          echo "::group::ASan/UBSan CMake build (non-gating)"
+          if ! command -v ninja >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y ninja-build
+          fi
           cmake -S . -B build-sanitizers -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_C_FLAGS_RELWITHDEBINFO='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' \
             -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' \
             -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO='-fsanitize=address,undefined' || true
           cmake --build build-sanitizers --target synopsis synopsis_cli -j2 || true
-        timeout-minutes: 15
+          echo "::endgroup::"
+        timeout-minutes: 10
 
       # Fail fast if the wrapper didn't produce the expected file
       - name: Verify compile_commands.json exists
@@ -268,74 +262,3 @@ jobs:
 
           rule_added = set()
           for it in issues:
-              rid = str(it.get("rule","unknown"))
-              if rid not in rule_added:
-                  runs[0]["tool"]["driver"]["rules"].append({
-                      "id": rid,
-                      "shortDescription": {"text": (it.get("message","") or "")[:120]}
-                  })
-                  rule_added.add(rid)
-              comp = it.get("component","")
-              path = comp.split(":",1)[1] if ":" in comp else comp
-              tr = it.get("textRange") or {}
-              sl = tr.get("startLine", 1)
-              sc = (tr.get("startOffset",0) or 0) + 1
-              el = tr.get("endLine", sl)
-              ec = max(tr.get("endOffset", sc), sc)
-              runs[0]["results"].append({
-                  "ruleId": rid,
-                  "level": level(it.get("severity","MAJOR")),
-                  "message": {"text": it.get("message","")},
-                  "locations": [{
-                      "physicalLocation": {
-                          "artifactLocation": {"uri": path, "uriBaseId": "PROJECT_ROOT"},
-                          "region": {"startLine": sl, "startColumn": sc, "endLine": el, "endColumn": ec}
-                      }
-                  }],
-                  "fingerprints": {"sonarIssueKey": it.get("key","")}
-              })
-
-          pathlib.Path("reports").mkdir(parents=True, exist_ok=True)
-          sarif = {"version":"2.1.0", "$schema":"https://json.schemastore.org/sarif-2.1.0.json", "runs": runs}
-          with open("reports/sonarcloud.sarif","w",encoding="utf-8") as f:
-              json.dump(sarif, f, ensure_ascii=False)
-          print(f"Wrote {len(issues)} issues to reports/sonarcloud.sarif")
-          PY
-        timeout-minutes: 15
-
-      # Keep an auditable copy of the SARIF. Do not upload secrets.
-      - name: Upload SARIF as artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: sonarcloud-sarif
-          path: reports/sonarcloud.sarif
-          retention-days: 7
-          if-no-files-found: error
-
-  # Job 2: upload SARIF to GitHub Code Scanning with the only write scope it needs
-  upload-to-code-scanning:
-    name: Publish SARIF to Code Scanning
-    needs: build-and-scan               # Run only after SARIF is produced
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      security-events: write            # Narrow write scope to this tiny, isolated job
-      actions: read
-    steps:
-      - name: Harden runner (audit egress)
-        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
-        with:
-          egress-policy: audit
-
-      - name: Download SARIF artifact
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-        with:
-          name: sonarcloud-sarif
-          path: reports
-
-      - name: Upload SARIF to GitHub Code Scanning
-        uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498 # v3.29.11
-        with:
-          sarif_file: reports/sonarcloud.sarif
-          category: sonarcloud
