@@ -104,13 +104,8 @@ jobs:
         uses: SonarSource/sonarqube-scan-action/install-build-wrapper@1a6d90ebcb0e6a6b1d87e37ba693fe453195ae25 # v5.3.1
         # For SonarCloud, no SONAR_HOST_URL env is required; action defaults to sonarcloud.io
 
+      # NOTE: We inject extra analysis/hardening flags via CMake *build-type* variables (no repo edits).
       # Build Wrapper captures the compile so the analyzer knows exactly how files were built
-      # Compile under the Build Wrapper. This produces BW_OUT/compile_commands.json that the C analyzer needs.
-      # NOTE: We inject extra analysis/hardening flags via CMake *build-type* variables (no repo edits).
-            # Build Wrapper captures the compile so the analyzer knows exactly how files were built
-      # Compile under the Build Wrapper. This produces BW_OUT/compile_commands.json that the C analyzer needs.
-      # NOTE: We inject extra analysis/hardening flags via CMake *build-type* variables (no repo edits).
-            # Build Wrapper captures the compile so the analyzer knows exactly how files were built
       # Compile under the Build Wrapper. This produces BW_OUT/compile_commands.json that the C/C++ analyzer needs.
       # We now do TWO wrapped builds (NDEBUG + DEBUG) to exercise more code paths,
       # and then a bounded header-probe pass to pull header-defined code into the DB.
@@ -143,7 +138,7 @@ jobs:
               -DCMAKE_C_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS} ${CANCEL_COVERAGE} -DNDEBUG=1' \
               -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS} ${CANCEL_COVERAGE} -DNDEBUG=1' \
               -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO='${LDFLAGS}';
-            cmake --build build-rd --target all -j2
+            cmake --build build-rd --target all -j3
           "
 
           # -------------------------------
@@ -157,7 +152,7 @@ jobs:
               -DCMAKE_C_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS} ${CANCEL_COVERAGE} -DDEBUG=1' \
               -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS} ${CANCEL_COVERAGE} -DDEBUG=1' \
               -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO='${LDFLAGS}';
-            cmake --build build-dbg --target all -j2
+            cmake --build build-dbg --target all -j3
           "
 
           # -----------------------------------------
@@ -172,7 +167,7 @@ jobs:
             esac
             langflag='-xc'
             [[ "$h" =~ \.hh$|\.hpp$|\.hxx$|\.H$ ]] && langflag='-xc++'
-            timeout 20s build-wrapper-linux-x86-64 --out-dir "${BW_OUT}" \
+            timeout 30s build-wrapper-linux-x86-64 --out-dir "${BW_OUT}" \
               sh -c "gcc -O0 -g ${RELAXED_FLAGS} -I. ${langflag} -include \"$h\" -c /dev/null -o /tmp/probe.$$\.o" || true
           done
           echo "::endgroup::"
@@ -207,7 +202,7 @@ jobs:
             -DCMAKE_C_FLAGS_RELWITHDEBINFO='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' \
             -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' \
             -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO='-fsanitize=address,undefined' || true
-          cmake --build build-sanitizers --target synopsis synopsis_cli -j2 || true
+          cmake --build build-sanitizers --target synopsis synopsis_cli -j3 || true
           echo "::endgroup::"
         timeout-minutes: 10
 
