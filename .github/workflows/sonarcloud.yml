@@ -107,6 +107,9 @@ jobs:
       # Build Wrapper captures the compile so the analyzer knows exactly how files were built
       # Compile under the Build Wrapper. This produces BW_OUT/compile_commands.json that the C analyzer needs.
       # NOTE: We inject extra analysis/hardening flags via CMake *build-type* variables (no repo edits).
+            # Build Wrapper captures the compile so the analyzer knows exactly how files were built
+      # Compile under the Build Wrapper. This produces BW_OUT/compile_commands.json that the C analyzer needs.
+      # NOTE: We inject extra analysis/hardening flags via CMake *build-type* variables (no repo edits).
       - name: Configure & build with CMake under Build Wrapper
         run: |
           set -euxo pipefail
@@ -124,17 +127,24 @@ jobs:
           LDFLAGS="-Wl,-z,relro,-z,now -pie"
           RELAXED_FLAGS="-Wno-error"
 
+          # If your CMake injects coverage (via CodeCoverage.cmake), cancel it here to save RAM/CPU:
+          CANCEL_COVERAGE="-fno-profile-arcs -fno-test-coverage"
+
+          # Wrap both configure (so generator records our flags) and build (actual compilation).
+          # Build main targets *and tests* so more TUs are captured; keep parallelism modest.
           build-wrapper-linux-x86-64 --out-dir "${BW_OUT}" bash -lc "
             cmake -S . -B build -G Ninja \
               -DCMAKE_BUILD_TYPE=RelWithDebInfo \
               -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
               -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF \
-              -DCMAKE_C_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS}' \
-              -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS}' \
+              -DCMAKE_C_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS} ${CANCEL_COVERAGE}' \
+              -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS} ${CANCEL_COVERAGE}' \
               -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO='${LDFLAGS}';
-            cmake --build build --target synopsis synopsis_cli -j$(nproc)
+            cmake --build build --target synopsis synopsis_cli synopsis_test -j2
           "
         timeout-minutes: 25
+
+
 
       # Optional secondary builds to enrich static analysis signals (do not gate CI)
       - name: Secondary analysis-only builds (per-file fanalyzer for C, plus ASan/UBSan)
