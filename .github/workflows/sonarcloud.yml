@@ -126,12 +126,11 @@ jobs:
 
           # Flags to enrich static analysis signals and harden builds.
           BASE_CFLAGS="-O2 -g -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fPIE"
-          HARDEN_WARNINGS="-Wall -Wextra -Wformat=2 -Wformat-security -Wconversion -Wshadow -Wduplicated-cond -Wlogical-op -Wnull-dereference -fno-common"
+          # Wrapped build warnings (lenient): intentionally **exclude** -Wnull-dereference here
+          HARDEN_WARNINGS_WRAP="-Wall -Wextra -Wformat=2 -Wformat-security -Wconversion -Wshadow -Wduplicated-cond -Wlogical-op -fno-common"
           LDFLAGS="-Wl,-z,relro,-z,now -pie"
 
           # Ensure the WRAPPED build succeeds even if code is intentionally vulnerable.
-          # If your project forces -Werror later at target scope, this may need to be mirrored per-target;
-          # in most projects, adding -Wno-error here is sufficient because "last flag wins" for GCC/Clang.
           RELAXED_FLAGS="-Wno-error"
 
           # Wrap both configure (so generator records our flags) and build (actual compilation).
@@ -139,8 +138,9 @@ jobs:
             cmake -S . -B build -G Ninja \
               -DCMAKE_BUILD_TYPE=RelWithDebInfo \
               -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-              -DCMAKE_C_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS} ${RELAXED_FLAGS}' \
-              -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS} ${RELAXED_FLAGS}' \
+              -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF \
+              -DCMAKE_C_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS}' \
+              -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS}' \
               -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO='${LDFLAGS}';
             cmake --build build -j\$(nproc)
           "
@@ -153,15 +153,15 @@ jobs:
           # GCC/Clang static analyzer pass (C and C++)
           cmake -S . -B build-fan -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_C_FLAGS_RELWITHDEBINFO='-O1 -g -fanalyzer' \
-            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O1 -g -fanalyzer' || true
+            -DCMAKE_C_FLAGS_RELWITHDEBINFO='-O1 -g -fanalyzer -Wnull-dereference' \
+            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O1 -g -fanalyzer -Wnull-dereference' || true
           cmake --build build-fan -j"$(nproc)" || true
 
           # ASan/UBSan build (linker needs the sanitizer runtime too)
           cmake -S . -B build-sanitizers -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_C_FLAGS_RELWITHDEBINFO='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' \
-            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' \
+            -DCMAKE_C_FLAGS_RELWITHDEBINFO='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -Wnull-dereference' \
+            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -Wnull-dereference' \
             -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO='-fsanitize=address,undefined' || true
           cmake --build build-sanitizers -j"$(nproc)" || true
 
