@@ -141,12 +141,15 @@ jobs:
         run: |
           set -euxo pipefail
 
-          echo "::group::Per-file C fanalyzer (non-gating)"
-          # Analyze ONLY C files; compile one-at-a-time to keep memory low; never fail the job.
-          mapfile -t CFILES < <(git ls-files -- '*.c' ':!:**/test/**' 2>/dev/null || true)
+          echo "::group::Per-file C fanalyzer (non-gating, bounded)"
+          # Gather C files, exclude tests and the giant amalgamation sqlite3.c
+          mapfile -t CFILES < <(git ls-files -- '*.c' ':!:**/test/**' | grep -vE '/sqlite3\.c$' || true)
+
+          # Analyze each file with a per-file timeout and low priority; never gate CI.
           for f in "${CFILES[@]}"; do
             echo "analyze: $f"
-            gcc -O0 -g -fanalyzer -Wnull-dereference -c "$f" -o /tmp/$(basename "$f").o || true
+            # 90s per file should keep total time sane; adjust if needed.
+            timeout 90s nice -n 10 gcc -O0 -g -fanalyzer -Wnull-dereference -c "$f" -o /dev/null || true
           done
           echo "::endgroup::"
 
@@ -163,6 +166,7 @@ jobs:
           cmake --build build-sanitizers --target synopsis synopsis_cli -j2 || true
           echo "::endgroup::"
         timeout-minutes: 10
+
 
       # Fail fast if the wrapper didn't produce the expected file
       - name: Verify compile_commands.json exists
