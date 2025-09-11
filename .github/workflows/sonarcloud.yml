@@ -1,4 +1,4 @@
-# SonarCloud analysis for a tiny C repo (single main.c)
+# SonarCloud analysis for this C repo
 # -----------------------------------------------------------------------------
 # What this does:
 #   1) Builds the code under Sonar's Build Wrapper (produces compile_commands.json)
@@ -8,8 +8,8 @@
 #   4) Publishes the SARIF to GitHub Code Scanning in a separate, least-privilege job
 #
 # Why it looks this way (key principles):
-#   • Default‑deny permissions – read‑only by default; elevate only in the upload job
-#   • Pinned actions – commit SHAs, not floating tags, for reproducibility and tamper‑resistance
+#   • Default-deny permissions – read-only by default; elevate only in the upload job
+#   • Pinned actions – commit SHAs, not floating tags, for reproducibility and tamper-resistance
 #   • Hardened egress – audit (or block) network calls to limit exfiltration risk
 #   • Concurrency – cancel superseded runs to save time and money
 #   • Timeouts – fail fast instead of hanging for hours
@@ -25,32 +25,48 @@
 #
 # Secret needed:
 #   • SONAR_TOKEN (Actions → Secrets) – a SonarCloud user token with access to the project
+#
+# CMake-only edits in the workflow. We inject enrichment flags via `-D CMAKE_*_FLAGS_<CONFIG>=...`
+# at configure time, while running the actual build under the Sonar build-wrapper so it still emits
+# `compile_commands.json`. We can also keep strict/experimental builds (fanalyzer, ASan/UBSan)
+# as non-gating extras.
+#
+# Tips/gotchas:
+# If your CMakeLists.txt forces -Werror via target_compile_options(... -Werror ...) after global flags,
+# you may still get failures. In most setups, build-type flags with -Wno-error are appended and win.
+# If not, consider a non-`-Werror` preset for the wrapped build and keep strictness in the optional builds.
+#
+# Since synopsis' CMakeLists.txt has: `set (CMAKE_CXX_FLAGS "-Wnon-virtual-dtor")`, it overwrites
+# plain CMAKE_CXX_FLAGS from a workflow. So we inject extra flags into build-type vars that CMake
+# appends: CMAKE_C_FLAGS_<CONFIG>, CMAKE_CXX_FLAGS_<CONFIG>, CMAKE_EXE_LINKER_FLAGS_<CONFIG>.
 
-name: SonarCloud (C)
+name: SonarCloud (C - synopsis)
 
 on:
   push:
     branches: [ "main" ]
     # Trigger only when C sources, the workflow, or Sonar properties change
-    # paths:
-    #  - '**/*.c'
-    #  - 'sonar-project.properties'
-    #  - '.github/workflows/sonarcloud.yml'
+    paths:
+      - '**/*.c'
+      - '**/*.h'
+      - 'sonar-project.properties'
+      - '.github/workflows/sonarcloud.yml'
   pull_request:
     branches: [ "main" ]
     types: [opened, synchronize, reopened]
     # paths:
     #  - '**/*.c'
+    #  - '**/*.h'
     #  - 'sonar-project.properties'
     #  - '.github/workflows/sonarcloud.yml'
   # workflow_dispatch:
 
-# Cancel older in‑flight runs of the same ref. Avoids CI pile‑ups on active PRs.
+# Cancel older in-flight runs of the same ref. Avoids CI pile-ups on active PRs.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
   cancel-in-progress: true
 
-# Default‑deny: grant only read by default at the workflow level.
+# Default-deny: grant only read by default at the workflow level.
 permissions:
   contents: read
 
@@ -59,9 +75,9 @@ jobs:
   build-and-scan:
     name: Build and analyze
     runs-on: ubuntu-24.04            # Explicit runner version for reproducibility
-    timeout-minutes: 30              # Cap wall‑clock time for the job
+    timeout-minutes: 30              # Cap wall-clock time for the job
     permissions:
-      contents: read                 # Read‑only; no secret write scopes here
+      contents: read                 # Read-only; no secret write scopes here
     env:
       BW_OUT: bw-out                 # Directory where the Build Wrapper writes output
 
@@ -94,17 +110,60 @@ jobs:
         uses: SonarSource/sonarqube-scan-action/install-build-wrapper@1a6d90ebcb0e6a6b1d87e37ba693fe453195ae25 # v5.3.1
         # For SonarCloud, no SONAR_HOST_URL env is required; action defaults to sonarcloud.io
 
+      # Build Wrapper captures the compile so the analyzer knows exactly how files were built
       # Compile under the Build Wrapper. This produces BW_OUT/compile_commands.json that the C analyzer needs.
-      # Note: This command compiles and links a tiny program. For real builds, run your actual build here (make, cmake, etc.).
-      - name: Wrap compile (gcc)
+      # NOTE: We inject extra analysis/hardening flags via CMake *build-type* variables (no repo edits).
+      - name: Configure & build with CMake under Build Wrapper
         run: |
           set -euxo pipefail
           mkdir -p "${BW_OUT}"
-          # Build Wrapper captures the compile so the analyzer knows exactly how files were built
-          build-wrapper-linux-x86-64 --out-dir "${BW_OUT}" \
-            sh -c 'cmake -S . -B build; cmake --build build'
-            # sh -c 'gcc -std=c17 -I. -O2 -g main.c -o main'
-        timeout-minutes: 5
+
+          # Optional: Ninja makes multi-file CMake builds faster and more reproducible.
+          if ! command -v ninja >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y ninja-build
+          fi
+
+          # Flags to enrich static analysis signals and harden builds.
+          BASE_CFLAGS="-O2 -g -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fPIE"
+          HARDEN_WARNINGS="-Wall -Wextra -Wformat=2 -Wformat-security -Wconversion -Wshadow -Wduplicated-cond -Wlogical-op -Wnull-dereference -fno-common"
+          LDFLAGS="-Wl,-z,relro,-z,now -pie"
+
+          # Ensure the WRAPPED build succeeds even if code is intentionally vulnerable.
+          # If your project forces -Werror later at target scope, this may need to be mirrored per-target;
+          # in most projects, adding -Wno-error here is sufficient because "last flag wins" for GCC/Clang.
+          RELAXED_FLAGS="-Wno-error"
+
+          # Wrap both configure (so generator records our flags) and build (actual compilation).
+          build-wrapper-linux-x86-64 --out-dir "${BW_OUT}" bash -lc "
+            cmake -S . -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+              -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+              -DCMAKE_C_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS} ${RELAXED_FLAGS}' \
+              -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS} ${RELAXED_FLAGS}' \
+              -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO='${LDFLAGS}';
+            cmake --build build -j\$(nproc)
+          "
+        timeout-minutes: 120
+
+      # Optional secondary builds to enrich static analysis signals (do not gate CI)
+      - name: Secondary analysis-only CMake builds (fanalyzer, ASan/UBSan)
+        run: |
+          set -euxo pipefail
+          # GCC/Clang static analyzer pass (C and C++)
+          cmake -S . -B build-fan -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_FLAGS_RELWITHDEBINFO='-O1 -g -fanalyzer' \
+            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O1 -g -fanalyzer' || true
+          cmake --build build-fan -j"$(nproc)" || true
+
+          # ASan/UBSan build (linker needs the sanitizer runtime too)
+          cmake -S . -B build-sanitizers -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_FLAGS_RELWITHDEBINFO='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' \
+            -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' \
+            -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO='-fsanitize=address,undefined' || true
+          cmake --build build-sanitizers -j"$(nproc)" || true
 
       # Fail fast if the wrapper didn't produce the expected file
       - name: Verify compile_commands.json exists
@@ -122,6 +181,11 @@ jobs:
         with:
           args: >
             --define sonar.cfamily.compile-commands=${{ env.BW_OUT }}/compile_commands.json
+            --define sonar.verbose=true
+
+      # --define sonar.scm.exclusions.disabled=false
+      # --define sonar.sourceEncoding=UTF-8
+      # --define sonar.ws.timeout=120
 
       # Convert SonarCloud issues → SARIF so GitHub Code Scanning can ingest them.
       # Why a custom step? SonarCloud doesn’t publish SARIF directly, so we fetch issues via API and transcode.
