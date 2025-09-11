@@ -262,3 +262,74 @@ jobs:
 
           rule_added = set()
           for it in issues:
+              rid = str(it.get("rule","unknown"))
+              if rid not in rule_added:
+                  runs[0]["tool"]["driver"]["rules"].append({
+                      "id": rid,
+                      "shortDescription": {"text": (it.get("message","") or "")[:120]}
+                  })
+                  rule_added.add(rid)
+              comp = it.get("component","")
+              path = comp.split(":",1)[1] if ":" in comp else comp
+              tr = it.get("textRange") or {}
+              sl = tr.get("startLine", 1)
+              sc = (tr.get("startOffset",0) or 0) + 1
+              el = tr.get("endLine", sl)
+              ec = max(tr.get("endOffset", sc), sc)
+              runs[0]["results"].append({
+                  "ruleId": rid,
+                  "level": level(it.get("severity","MAJOR")),
+                  "message": {"text": it.get("message","")},
+                  "locations": [{
+                      "physicalLocation": {
+                          "artifactLocation": {"uri": path, "uriBaseId": "PROJECT_ROOT"},
+                          "region": {"startLine": sl, "startColumn": sc, "endLine": el, "endColumn": ec}
+                      }
+                  }],
+                  "fingerprints": {"sonarIssueKey": it.get("key","")}
+              })
+
+          pathlib.Path("reports").mkdir(parents=True, exist_ok=True)
+          sarif = {"version":"2.1.0", "$schema":"https://json.schemastore.org/sarif-2.1.0.json", "runs": runs}
+          with open("reports/sonarcloud.sarif","w",encoding="utf-8") as f:
+              json.dump(sarif, f, ensure_ascii=False)
+          print(f"Wrote {len(issues)} issues to reports/sonarcloud.sarif")
+          PY
+        timeout-minutes: 15
+
+      # Keep an auditable copy of the SARIF. Do not upload secrets.
+      - name: Upload SARIF as artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sonarcloud-sarif
+          path: reports/sonarcloud.sarif
+          retention-days: 7
+          if-no-files-found: error
+
+  # Job 2: upload SARIF to GitHub Code Scanning with the only write scope it needs
+  upload-to-code-scanning:
+    name: Publish SARIF to Code Scanning
+    needs: build-and-scan               # Run only after SARIF is produced
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write            # Narrow write scope to this tiny, isolated job
+      actions: read
+    steps:
+      - name: Harden runner (audit egress)
+        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+        with:
+          egress-policy: audit
+
+      - name: Download SARIF artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: sonarcloud-sarif
+          path: reports
+
+      - name: Upload SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@3c3833e0f8c1c83d449a7478aa59c036a9165498 # v3.29.11
+        with:
+          sarif_file: reports/sonarcloud.sarif
+          category: sonarcloud
