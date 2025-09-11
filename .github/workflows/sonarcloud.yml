@@ -114,7 +114,7 @@ jobs:
       # Compile under the Build Wrapper. This produces BW_OUT/compile_commands.json that the C/C++ analyzer needs.
       # We now do TWO wrapped builds (NDEBUG + DEBUG) to exercise more code paths,
       # and then a bounded header-probe pass to pull header-defined code into the DB.
-            - name: Configure & build with CMake under Build Wrapper (NDEBUG + DEBUG + header-probe)
+      - name: Configure & build with CMake under Build Wrapper (NDEBUG + DEBUG + header-probe)
         run: |
           set -euxo pipefail
           mkdir -p "${BW_OUT}"
