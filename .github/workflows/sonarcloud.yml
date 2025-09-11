@@ -114,42 +114,35 @@ jobs:
       # Compile under the Build Wrapper. This produces BW_OUT/compile_commands.json that the C/C++ analyzer needs.
       # We now do TWO wrapped builds (NDEBUG + DEBUG) to exercise more code paths,
       # and then a bounded header-probe pass to pull header-defined code into the DB.
-      - name: Configure & build with CMake under Build Wrapper (NDEBUG + DEBUG + header-probe)
+            - name: Configure & build with CMake under Build Wrapper (NDEBUG + DEBUG + header-probe)
         run: |
           set -euxo pipefail
           mkdir -p "${BW_OUT}"
 
-          # Optional: Ninja makes multi-file CMake builds faster and more reproducible.
+          # Optional: Ninja for faster, reproducible CMake builds
           if ! command -v ninja >/dev/null 2>&1; then
             sudo apt-get update -y
             sudo apt-get install -y ninja-build
           fi
 
-          # Flags to enrich static analysis signals and harden builds (lenient in wrapped builds).
+          # Flags (lenient under wrapper)
           BASE_CFLAGS="-O2 -g -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fPIE"
           HARDEN_WARNINGS_WRAP="-Wall -Wextra -Wformat=2 -Wformat-security -Wconversion -Wshadow -Wduplicated-cond -Wlogical-op -fno-common"
           LDFLAGS="-Wl,-z,relro,-z,now -pie"
           RELAXED_FLAGS="-Wno-error"
-
-          # Neutralize any coverage flags your CMake adds (saves RAM/CPU under the wrapper).
           CANCEL_COVERAGE="-fno-profile-arcs -fno-test-coverage"
-
-          cmake_config() {
-            # $1 = build dir; $2 = extra C/CXX defines (e.g., -DNDEBUG=1 or -DDEBUG=1)
-            cmake -S . -B "$1" -G Ninja \
-              -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-              -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-              -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF \
-              -DCMAKE_C_FLAGS_RELWITHDEBINFO="${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS} ${CANCEL_COVERAGE} $2" \
-              -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS} ${CANCEL_COVERAGE} $2" \
-              -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO="${LDFLAGS}"
-          }
 
           # -------------------------------
           # Wrapped build #1 (NDEBUG path)
           # -------------------------------
           build-wrapper-linux-x86-64 --out-dir "${BW_OUT}" bash -lc "
-            cmake_config build-rd '-DNDEBUG=1';
+            cmake -S . -B build-rd -G Ninja \
+              -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+              -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+              -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF \
+              -DCMAKE_C_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS} ${CANCEL_COVERAGE} -DNDEBUG=1' \
+              -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS} ${CANCEL_COVERAGE} -DNDEBUG=1' \
+              -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO='${LDFLAGS}';
             cmake --build build-rd --target all -j2
           "
 
@@ -157,34 +150,30 @@ jobs:
           # Wrapped build #2 (DEBUG path)
           # -------------------------------
           build-wrapper-linux-x86-64 --out-dir "${BW_OUT}" bash -lc "
-            cmake_config build-dbg '-DDEBUG=1';
+            cmake -S . -B build-dbg -G Ninja \
+              -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+              -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+              -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF \
+              -DCMAKE_C_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS} ${CANCEL_COVERAGE} -DDEBUG=1' \
+              -DCMAKE_CXX_FLAGS_RELWITHDEBINFO='${BASE_CFLAGS} ${HARDEN_WARNINGS_WRAP} ${RELAXED_FLAGS} ${CANCEL_COVERAGE} -DDEBUG=1' \
+              -DCMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO='${LDFLAGS}';
             cmake --build build-dbg --target all -j2
           "
 
           # -----------------------------------------
           # Header-probe under wrapper (bounded)
           # -----------------------------------------
-          # Goal: add compile DB entries for header-defined code (inline/template),
-          # without dragging in third-party or gargantuan files.
-          # We compile each header as a dummy TU with -x c or -x c++ based on extension.
-          # Time-box each compile to avoid stalls; never fail the job.
-          probe_one_header() {
-            hdr="$1"
-            case "$hdr" in
-              */_deps/*|*/third_party/*|*/external/*|*/extern/*|*/.venv/*) return 0 ;;
-              */sqlite3.h|*/sqlite3ext.h|*/sqlite3.c|*/sqlite3*.hpp) return 0 ;;
-            esac
-            langflag="-xc"
-            [[ "$hdr" =~ \.hh$|\.hpp$|\.hxx$|\.H$ ]] && langflag="-xc++"
-            timeout 20s build-wrapper-linux-x86-64 --out-dir "${BW_OUT}" \
-              sh -c "gcc -O0 -g ${RELAXED_FLAGS} -I. ${langflag} -include \"$hdr\" -c /dev/null -o /tmp/probe.$$.o" || true
-          }
-
           echo "::group::Header-probe (under wrapper; bounded)"
-          # Probe headers in project include/ and src/ trees only.
+          # Probe headers in project trees only; skip third-party and sqlite amalgamation.
           mapfile -t HDRS < <(git ls-files -- 'include/**/*.h' 'include/**/*.hpp' 'src/**/*.h' 'src/**/*.hpp' 2>/dev/null || true)
           for h in "${HDRS[@]}"; do
-            probe_one_header "$h"
+            case "$h" in
+              */_deps/*|*/third_party/*|*/external/*|*/extern/*|*/.venv/*|*/sqlite3.h|*/sqlite3ext.h) continue ;;
+            esac
+            langflag='-xc'
+            [[ "$h" =~ \.hh$|\.hpp$|\.hxx$|\.H$ ]] && langflag='-xc++'
+            timeout 20s build-wrapper-linux-x86-64 --out-dir "${BW_OUT}" \
+              sh -c "gcc -O0 -g ${RELAXED_FLAGS} -I. ${langflag} -include \"$h\" -c /dev/null -o /tmp/probe.$$\.o" || true
           done
           echo "::endgroup::"
         timeout-minutes: 30
